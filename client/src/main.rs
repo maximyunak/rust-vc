@@ -44,7 +44,7 @@ impl App {
             name: std::env::var("USERNAME")
                 .or_else(|_| std::env::var("USER"))
                 .unwrap_or_else(|_| "Гость".into()),
-            server: "127.0.0.1:4000".into(),
+            server: "2.26.23.72:4000".into(),
             room_text: String::new(),
             inputs: list_devices(true),
             outputs: list_devices(false),
