@@ -8,3 +8,5 @@ common = { path = "../common" }
 eframe = "0.29"
 cpal = "0.15"
 opus = "0.3"
+nnnoiseless = "0.5.2"
+aec-rs = "1.0.0"

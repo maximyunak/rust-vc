@@ -47,6 +47,8 @@ pub struct Call {
     mixer: Arc<Mutex<Mixer>>,
     pub muted: Arc<AtomicBool>,
     pub deaf: Arc<AtomicBool>,
+    pub denoise: Arc<AtomicBool>,
+    pub echo: Arc<AtomicBool>,
     level: Arc<AtomicU32>,
     stop: Arc<AtomicBool>,
     sock: Arc<UdpSocket>,
@@ -70,23 +72,46 @@ fn rms(x: &[f32]) -> f32 {
 
 pub fn list_devices(input: bool) -> Vec<String> {
     let host = cpal::default_host();
-    let devs = if input { host.input_devices() } else { host.output_devices() };
-    devs.map(|d| d.filter_map(|d| d.name().ok()).collect()).unwrap_or_default()
+    let devs = if input {
+        host.input_devices()
+    } else {
+        host.output_devices()
+    };
+    devs.map(|d| d.filter_map(|d| d.name().ok()).collect())
+        .unwrap_or_default()
 }
 
 fn pick(host: &cpal::Host, name: Option<&str>, input: bool) -> Result<cpal::Device, String> {
     if let Some(n) = name {
-        let mut devs = if input { host.input_devices() } else { host.output_devices() }
-            .map_err(|e| e.to_string())?;
+        let mut devs = if input {
+            host.input_devices()
+        } else {
+            host.output_devices()
+        }
+        .map_err(|e| e.to_string())?;
         if let Some(d) = devs.find(|d| d.name().ok().as_deref() == Some(n)) {
             return Ok(d);
         }
     }
-    let d = if input { host.default_input_device() } else { host.default_output_device() };
-    d.ok_or_else(|| if input { "Микрофон не найден".into() } else { "Устройство вывода не найдено".into() })
+    let d = if input {
+        host.default_input_device()
+    } else {
+        host.default_output_device()
+    };
+    d.ok_or_else(|| {
+        if input {
+            "Микрофон не найден".into()
+        } else {
+            "Устройство вывода не найдено".into()
+        }
+    })
 }
 
-fn input_stream<T>(dev: &cpal::Device, cfg: &StreamConfig, cap: Arc<Mutex<VecDeque<f32>>>) -> Result<Stream, String>
+fn input_stream<T>(
+    dev: &cpal::Device,
+    cfg: &StreamConfig,
+    cap: Arc<Mutex<VecDeque<f32>>>,
+) -> Result<Stream, String>
 where
     T: SizedSample,
     f32: FromSample<T>,
@@ -121,7 +146,13 @@ where
     Ok(stream)
 }
 
-fn output_stream<T>(dev: &cpal::Device, cfg: &StreamConfig, mixer: Arc<Mutex<Mixer>>, deaf: Arc<AtomicBool>) -> Result<Stream, String>
+fn output_stream<T>(
+    dev: &cpal::Device,
+    cfg: &StreamConfig,
+    mixer: Arc<Mutex<Mixer>>,
+    deaf: Arc<AtomicBool>,
+    refq: Arc<Mutex<VecDeque<f32>>>,
+) -> Result<Stream, String>
 where
     T: SizedSample + FromSample<f32>,
 {
@@ -133,6 +164,7 @@ where
             cfg,
             move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
                 let mut m = mixer.lock().unwrap();
+                let mut rq = refq.lock().unwrap();
                 let deaf = deaf.load(Relaxed);
                 for frame in data.chunks_mut(ch) {
                     while pos >= 1.0 {
@@ -140,6 +172,7 @@ where
                         prev = cur;
                         let v = m.pull();
                         cur = if deaf { 0.0 } else { v };
+                        rq.push_back(cur);
                     }
                     let v = prev + (cur - prev) * pos as f32;
                     pos += step;
@@ -164,7 +197,9 @@ fn handle(mixer: &Mutex<Mixer>, kind: u8, user: u32, payload: &[u8], pcm: &mut [
         return;
     }
     if !m.peers.contains_key(&user) {
-        let Ok(dec) = Decoder::new(RATE, Channels::Mono) else { return };
+        let Ok(dec) = Decoder::new(RATE, Channels::Mono) else {
+            return;
+        };
         m.peers.insert(
             user,
             Peer {
@@ -194,7 +229,9 @@ fn handle(mixer: &Mutex<Mixer>, kind: u8, user: u32, payload: &[u8], pcm: &mut [
                 }
             }
             p.last_seq = Some(seq);
-            let Ok(n) = p.dec.decode_float(&payload[2..], pcm, false) else { return };
+            let Ok(n) = p.dec.decode_float(&payload[2..], pcm, false) else {
+                return;
+            };
             let pcm = &pcm[..n];
             if rms(pcm) > 0.01 {
                 p.last_voice = Some(Instant::now());
@@ -213,7 +250,13 @@ fn handle(mixer: &Mutex<Mixer>, kind: u8, user: u32, payload: &[u8], pcm: &mut [
 }
 
 impl Call {
-    pub fn start(server: &str, room: u64, name: &str, input: Option<&str>, output: Option<&str>) -> Result<Call, String> {
+    pub fn start(
+        server: &str,
+        room: u64,
+        name: &str,
+        input: Option<&str>,
+        output: Option<&str>,
+    ) -> Result<Call, String> {
         let addr = server
             .to_socket_addrs()
             .map_err(|e| format!("Адрес сервера: {e}"))?
@@ -233,8 +276,13 @@ impl Call {
         let mixer: Arc<Mutex<Mixer>> = Arc::default();
         let muted = Arc::new(AtomicBool::new(false));
         let deaf = Arc::new(AtomicBool::new(false));
+        let denoise = Arc::new(AtomicBool::new(true));
         let level = Arc::new(AtomicU32::new(0));
         let stop = Arc::new(AtomicBool::new(false));
+
+        let refq: Arc<Mutex<VecDeque<f32>>> = Arc::default();
+        let echo = Arc::new(AtomicBool::new(true));
+
 
         let sup = in_dev.default_input_config().map_err(|e| e.to_string())?;
         let cfg = sup.config();
@@ -248,18 +296,23 @@ impl Call {
         let sup = out_dev.default_output_config().map_err(|e| e.to_string())?;
         let cfg = sup.config();
         let out_stream = match sup.sample_format() {
-            SampleFormat::F32 => output_stream::<f32>(&out_dev, &cfg, mixer.clone(), deaf.clone()),
-            SampleFormat::I16 => output_stream::<i16>(&out_dev, &cfg, mixer.clone(), deaf.clone()),
-            SampleFormat::U16 => output_stream::<u16>(&out_dev, &cfg, mixer.clone(), deaf.clone()),
+            SampleFormat::F32 => output_stream::<f32>(&out_dev, &cfg, mixer.clone(), deaf.clone(), refq.clone()),
+            SampleFormat::I16 => output_stream::<i16>(&out_dev, &cfg, mixer.clone(), deaf.clone(), refq.clone()),
+            SampleFormat::U16 => output_stream::<u16>(&out_dev, &cfg, mixer.clone(), deaf.clone(), refq.clone()),
             f => Err(format!("Формат вывода не поддерживается: {f:?}")),
         }?;
 
-        let mut enc = Encoder::new(RATE, Channels::Mono, Application::Voip).map_err(|e| e.to_string())?;
+        let mut enc =
+            Encoder::new(RATE, Channels::Mono, Application::Voip).map_err(|e| e.to_string())?;
         enc.set_bitrate(Bitrate::Bits(32_000)).ok();
 
         // Поток отправки: кадры 20 мс -> Opus -> UDP
         {
-            let (sock, muted, level, stop) = (sock.clone(), muted.clone(), level.clone(), stop.clone());
+            let denoise = denoise.clone();
+            let echo = echo.clone();
+            let refq = refq.clone();
+            let (sock, muted, level, stop) =
+                (sock.clone(), muted.clone(), level.clone(), stop.clone());
             let name = name.trim().to_string();
             std::thread::spawn(move || {
                 let hello = |kind: u8| {
@@ -267,24 +320,75 @@ impl Call {
                     p.extend_from_slice(name.as_bytes());
                     let _ = sock.send(&p);
                 };
+                let config = aec_rs::AecConfig {
+                    frame_size: FRAME,
+                    filter_length: 9600,      // Corresponds to your previous 2nd argument
+                    sample_rate: RATE as u32,
+                    enable_preprocess: false,  // Corresponds to your previous 4th argument
+                };
+                let aec = aec_rs::Aec::new(&config);
+                let to_i16 = |x: &[f32]| -> Vec<i16> {
+                    x.iter().map(|v| (v * 32767.0).clamp(-32768.0, 32767.0) as i16).collect()
+                };
+                let mut dn = nnnoiseless::DenoiseState::new();
                 hello(JOIN);
+                refq.lock().unwrap().clear();
                 let (mut seq, mut hang) = (0u16, 0u32);
                 let mut last_ping = Instant::now();
                 let mut out = [0u8; 1400];
                 while !stop.load(Relaxed) {
                     let frame: Option<Vec<f32>> = {
                         let mut q = cap.lock().unwrap();
-                        if q.len() >= FRAME { Some(q.drain(..FRAME).collect()) } else { None }
+                        if q.len() >= FRAME {
+                            Some(q.drain(..FRAME).collect())
+                        } else {
+                            None
+                        }
                     };
-                    let Some(f) = frame else {
-                        std::thread::sleep(Duration::from_millis(4));
+                    let Some(mut f) = frame else {
+                        std::thread::sleep(Duration::from_millis(2));
                         continue;
                     };
+                    let far: Vec<f32> = {
+                        let mut r = refq.lock().unwrap();
+                        if r.len() > FRAME * 4 {
+                            let extra = r.len() - FRAME * 2;
+                            r.drain(..extra);
+                        }
+                        let n = r.len().min(FRAME);
+                        let mut v: Vec<f32> = r.drain(..n).collect();
+                        v.resize(FRAME, 0.0);
+                        v
+                    };
+                    if echo.load(Relaxed) {
+                        let rec = to_i16(&f);
+                        let farx = to_i16(&far);
+                        let mut clean = vec![0i16; FRAME];
+                        aec.cancel_echo(&rec, &farx, &mut clean);
+                        for (d, s) in f.iter_mut().zip(&clean) {
+                            *d = *s as f32 / 32768.0;
+                        }
+                    }
+                    if denoise.load(Relaxed) {
+                        let mut out_buf = [0f32; 480];
+                        for part in f.chunks_mut(480) {
+                            // RNNoise ждёт сэмплы в масштабе i16, а не от -1 до 1
+                            let inp: Vec<f32> = part.iter().map(|v| v * 32768.0).collect();
+                            dn.process_frame(&mut out_buf, &inp);
+                            for (d, s) in part.iter_mut().zip(out_buf.iter()) {
+                                *d = s / 32768.0;
+                            }
+                        }
+                    }
                     let muted = muted.load(Relaxed);
                     let r = if muted { 0.0 } else { rms(&f) };
                     level.store(r.to_bits(), Relaxed);
-                    let active = r > 0.004 || hang > 0;
-                    if r > 0.004 { hang = 15 } else if hang > 0 { hang -= 1 }
+                    let active = r > 0.0015 || hang > 0;
+                    if r > 0.0015 {
+                        hang = 15
+                    } else if hang > 0 {
+                        hang -= 1
+                    }
                     if active && !muted {
                         if let Ok(n) = enc.encode_float(&f, &mut out) {
                             let mut p = header(AUDIO, room, user);
@@ -318,18 +422,30 @@ impl Call {
                                 }
                             }
                         }
-                        Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) => {}
                         Err(_) => std::thread::sleep(Duration::from_millis(50)),
                     }
                     if last_prune.elapsed() > Duration::from_secs(1) {
                         last_prune = Instant::now();
-                        mixer.lock().unwrap().peers.retain(|_, p| p.last_seen.elapsed() < Duration::from_secs(5));
+                        mixer
+                            .lock()
+                            .unwrap()
+                            .peers
+                            .retain(|_, p| p.last_seen.elapsed() < Duration::from_secs(5));
                     }
                 }
             });
         }
 
-        Ok(Call { mixer, muted, deaf, level, stop, sock, room, user, _in: in_stream, _out: out_stream })
+        Ok(Call {
+            mixer, muted, deaf, denoise, echo, level, stop, sock, room, user,
+            _in: in_stream,
+            _out: out_stream,
+        })
     }
 
     pub fn peers(&self) -> Vec<PeerView> {
@@ -339,7 +455,9 @@ impl Call {
             .values()
             .map(|p| PeerView {
                 name: p.name.clone(),
-                speaking: p.last_voice.map_or(false, |t| t.elapsed() < Duration::from_millis(300)),
+                speaking: p
+                    .last_voice
+                    .map_or(false, |t| t.elapsed() < Duration::from_millis(300)),
             })
             .collect();
         v.sort_by(|a, b| a.name.cmp(&b.name));
