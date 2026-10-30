@@ -1,0 +1,10 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+common = { path = "../common" }
+eframe = "0.29"
+cpal = "0.15"
+opus = "0.3"
