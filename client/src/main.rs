@@ -7,6 +7,7 @@ use common::{format_link, parse_link, rand_u64};
 use eframe::egui::{self, Align, Align2, Color32, FontId, Layout, RichText, Sense, Vec2};
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
+use single_instance::SingleInstance;
 
 // ── палитра ────────────────────────────────────────────────
 const BG: Color32 = Color32::from_rgb(3, 5, 22);
@@ -360,6 +361,12 @@ fn handle_register(_: &Option<String>) -> bool {
 }
 
 fn main() -> eframe::Result<()> {
+    let instance = SingleInstance::new("voicers_app").unwrap();
+
+    if !instance.is_single() {
+        println!("Приложение уже запущено!");
+        return Ok(());
+    }
     let arg = std::env::args().nth(1);
     if handle_register(&arg) {
         return Ok(());
